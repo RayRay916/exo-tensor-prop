@@ -147,6 +147,9 @@ async def chat_request_to_text_generation(
     resolved_effort, resolved_thinking = resolve_reasoning_params(
         request.reasoning_effort, request.enable_thinking
     )
+    # exo-patch: hard-disable reasoning (client-proof)
+    resolved_thinking = False
+    resolved_effort = None
 
     return TextGenerationTaskParams(
         model=request.model,

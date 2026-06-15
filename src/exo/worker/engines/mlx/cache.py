@@ -562,6 +562,12 @@ def make_kv_cache(
 ) -> KVCacheType:
     assert hasattr(model, "layers")
 
+    # Opt-in KV-cache quantization via EXO_KV_BITS (KV_CACHE_BITS). Placed BEFORE
+    # model.make_cache() so it actually applies. Default (None) => unchanged behavior.
+    if KV_CACHE_BITS is not None and max_kv_size is None:
+        logger.info(f"Using quantized KV cache (bits={KV_CACHE_BITS}, group={CACHE_GROUP_SIZE})")
+        return [QuantizedKVCache(group_size=CACHE_GROUP_SIZE, bits=KV_CACHE_BITS) for _ in model.layers]
+
     if hasattr(model, "make_cache"):
         logger.info("Using MLX LM's make cache")
         return model.make_cache()  # type: ignore
