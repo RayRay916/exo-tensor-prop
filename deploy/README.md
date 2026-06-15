@@ -17,6 +17,18 @@ sharding added by this fork (see [`../docs/proportional-tp.md`](../docs/proporti
 3. Make sure the same `cluster.env` (or one with the same ports/namespace) is
    present in each worker's `deploy/` dir — workers source it via SSH.
 
+### Install variants
+
+`EXO_BIN` just has to point at *some* exo built from this fork's code:
+
+- **Standalone fork venv** (clean): build `~/exo-tensor-prop/.venv` per step 1 and
+  set `EXO_BIN="$HOME/exo-tensor-prop/.venv/bin/exo"`, `EXO_BIN_RE="exo-tensor-prop/[.]venv/bin/exo"`.
+- **Synced into an existing `~/exo`** (no separate build): if you copied the
+  fork's source into an existing editable `~/exo` checkout, point
+  `EXO_BIN="$HOME/exo/.venv/bin/exo"` and `EXO_BIN_RE="exo/[.]venv/bin/exo"`. The
+  scripts can also live in any dir on PATH via a symlink — `exoprop` resolves its
+  own real directory, so `cluster.env` is read next to the script, not the symlink.
+
 ## Usage
 
 ```bash

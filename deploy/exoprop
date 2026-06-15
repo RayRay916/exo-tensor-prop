@@ -13,7 +13,16 @@
 #   --ram           split sized by each node's available RAM (default)
 #   --weights SPEC  pin the split. SPEC = "128,64,64" (-> rank0..N) or "rank0:..,rank1:.."
 set -u
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# Resolve this script's real dir even when invoked via a symlink on PATH
+# (e.g. /opt/homebrew/bin/exoprop -> .../deploy/exoprop), so cluster.env and the
+# sibling scripts are found next to the real file, not next to the symlink.
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -L "$SOURCE" ]; do
+  _dir="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$_dir/$SOURCE" ;; esac
+done
+HERE="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 if [ -f "$HERE/cluster.env" ]; then . "$HERE/cluster.env"; else
   echo "exoprop: $HERE/cluster.env missing (copy cluster.env.example -> cluster.env)"; exit 1
 fi
