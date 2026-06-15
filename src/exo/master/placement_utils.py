@@ -241,6 +241,19 @@ def _get_shard_assignments_for_pure_pipeline(
     )
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float-valued env var, falling back to ``default`` on absence or a
+    malformed value (logged) rather than crashing placement."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"{name}={raw!r} is not a valid float; using {default}")
+        return default
+
+
 def _parse_node_weights_env() -> dict[str, float]:
     """Parse the EXO_NODE_WEIGHTS env var.
 
@@ -276,6 +289,35 @@ def _tensor_proportions(
     summing to 1.0.
     """
     env = _parse_node_weights_env()
+    world_size = len(node_ids)
+
+    # H6: surface misconfiguration rather than silently mis-weighting.
+    if env:
+        uuid_keys = [k for k in env if not k.startswith("rank")]
+        for key in uuid_keys:
+            matches = [str(nid) for nid in node_ids if key in str(nid)]
+            if not matches:
+                logger.warning(
+                    f"EXO_NODE_WEIGHTS key '{key}' matched no node in the cycle"
+                )
+            elif len(matches) > 1:
+                logger.warning(
+                    f"EXO_NODE_WEIGHTS key '{key}' is ambiguous: matches "
+                    f"{len(matches)} nodes {matches}; first one wins"
+                )
+        rank_keys = [k for k in env if k.startswith("rank")]
+        for key in rank_keys:
+            try:
+                idx = int(key[len("rank") :])
+            except ValueError:
+                logger.warning(f"EXO_NODE_WEIGHTS key '{key}' is not a valid rankN")
+                continue
+            if idx >= world_size:
+                logger.warning(
+                    f"EXO_NODE_WEIGHTS key '{key}' is out of range for a "
+                    f"{world_size}-node cycle"
+                )
+
     raw: list[float] = []
     for i, node_id in enumerate(node_ids):
         w: float | None = None
@@ -292,7 +334,7 @@ def _tensor_proportions(
 
     total = sum(raw)
     if total <= 0:
-        return [1.0 / len(node_ids)] * len(node_ids)
+        return [1.0 / world_size] * world_size
     return [w / total for w in raw]
 
 
@@ -300,6 +342,7 @@ def get_shard_assignments_for_tensor_parallel(
     model_card: ModelCard,
     cycle: Cycle,
     node_memory: Mapping[NodeId, MemoryUsage],
+    replicate_attention: bool = False,
 ) -> ShardAssignments:
     _validate_cycle(cycle)
     total_layers = model_card.n_layers
@@ -307,24 +350,37 @@ def get_shard_assignments_for_tensor_parallel(
     world_size = len(node_ids)
 
     proportions = _tensor_proportions(node_ids, node_memory)
-    # If the split is (near) even, leave proportions unset so workers take the
-    # original even code path — keeps behaviour bit-identical for equal nodes.
-    even = all(abs(p - 1.0 / world_size) < 1e-6 for p in proportions)
+    # H4: snap to the even (bit-exact) path when the split is within tolerance of
+    # uniform. RAM-derived weights on nominally-equal nodes are never *exactly*
+    # even, so a tight check would needlessly push homogeneous clusters onto the
+    # uneven path and lose upstream's bit-identical split. Tunable via
+    # EXO_TP_EVEN_TOL (max allowed per-rank deviation from 1/N).
+    even_tol = _env_float("EXO_TP_EVEN_TOL", 0.02)
+    even = all(abs(p - 1.0 / world_size) <= even_tol for p in proportions)
 
-    # Validate each node can hold its shard. Approximate: the MoE experts
-    # dominate an 80B-A3B's weight and are sharded by `proportions`, so a
-    # node's footprint tracks its proportion (attention stays even but is
-    # comparatively small). Fails here rather than OOMing mid-inference.
+    # H3: validate each node can hold its shard, conservatively. Footprint model:
+    # a replicated baseline (attention/embeddings/norms, present on every rank
+    # when replicate_attention is on) plus a proportional share of the rest, all
+    # times a headroom factor for KV cache / activations / runtime overhead.
+    # Fails here rather than OOMing mid-load. Both factors are env-tunable.
+    headroom = _env_float("EXO_TP_MEM_HEADROOM", 1.10)
+    replicate_fraction = (
+        min(max(_env_float("EXO_TP_REPLICATE_FRACTION", 0.10), 0.0), 1.0)
+        if replicate_attention
+        else 0.0
+    )
     total_storage_bytes = model_card.storage_size.in_bytes
     for i, node_id in enumerate(node_ids):
-        required = int(total_storage_bytes * proportions[i])
+        effective_share = replicate_fraction + (1.0 - replicate_fraction) * proportions[i]
+        required = int(headroom * total_storage_bytes * effective_share)
         available = node_memory[node_id].ram_available.in_bytes
         if required > available:
             raise ValueError(
                 f"Node {i} ({node_id}) has insufficient memory for its tensor "
                 f"shard: requires ~{required / 1e9:.2f} GB "
-                f"(proportion {proportions[i]:.3f}) but only "
-                f"{available / 1e9:.2f} GB available"
+                f"(proportion {proportions[i]:.3f}, headroom {headroom:.2f}"
+                f"{f', replicate {replicate_fraction:.2f}' if replicate_fraction else ''}"
+                f") but only {available / 1e9:.2f} GB available"
             )
 
     runner_to_shard: dict[RunnerId, ShardMetadata] = {}
@@ -339,6 +395,7 @@ def get_shard_assignments_for_tensor_parallel(
             end_layer=total_layers,
             n_layers=total_layers,
             proportions=None if even else proportions,
+            replicate_attention=replicate_attention,
         )
 
         runner_id = RunnerId()
@@ -361,6 +418,7 @@ def get_shard_assignments(
     cycle: Cycle,
     sharding: Sharding,
     node_memory: Mapping[NodeId, MemoryUsage],
+    replicate_attention: bool = False,
 ) -> ShardAssignments:
     match sharding:
         case Sharding.Pipeline:
@@ -374,6 +432,7 @@ def get_shard_assignments(
                 model_card=model_card,
                 cycle=cycle,
                 node_memory=node_memory,
+                replicate_attention=replicate_attention,
             )
 
 

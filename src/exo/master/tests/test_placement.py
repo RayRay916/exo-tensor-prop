@@ -379,10 +379,13 @@ def test_tensor_rdma_backend_connectivity_matrix(
     node_b = NodeId()
     node_c = NodeId()
 
+    # Per-node room above the even 500-byte shard so the tensor-placement
+    # memory check (now applies a headroom factor) doesn't reject this
+    # connectivity-matrix fixture on an exact fit.
     node_memory = {
-        node_a: create_node_memory(500),
-        node_b: create_node_memory(500),
-        node_c: create_node_memory(500),
+        node_a: create_node_memory(700),
+        node_b: create_node_memory(700),
+        node_c: create_node_memory(700),
     }
 
     ethernet_interface = NetworkInterfaceInfo(

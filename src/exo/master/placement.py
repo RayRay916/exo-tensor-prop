@@ -1,3 +1,4 @@
+import os
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Sequence
@@ -106,7 +107,9 @@ def place_instance(
     required_nodes: set[NodeId] | None = None,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
 ) -> dict[InstanceId, Instance]:
-    import os
+    # Read once on the master so placement and the worker's sharding agree
+    # (the decision travels in TensorShardMetadata, not the env, from here on).
+    replicate_attention = bool(os.environ.get("EXO_TP_REPLICATE_ATTN"))
     cycles = topology.get_cycles()
     candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
 
@@ -137,8 +140,13 @@ def place_instance(
         cycles_with_sufficient_memory = [
             cycle
             for cycle in cycles_with_sufficient_memory
-            if (command.model_card.hidden_size % len(cycle) == 0 or os.environ.get("EXO_TP_REPLICATE_ATTN"))
-            and (is_deepseek_v4 or kv_heads is None or kv_heads % len(cycle) == 0 or os.environ.get("EXO_TP_REPLICATE_ATTN"))
+            if (command.model_card.hidden_size % len(cycle) == 0 or replicate_attention)
+            and (
+                is_deepseek_v4
+                or kv_heads is None
+                or kv_heads % len(cycle) == 0
+                or replicate_attention
+            )
         ]
         if not cycles_with_sufficient_memory:
             raise ValueError(
@@ -212,7 +220,11 @@ def place_instance(
         )
 
     shard_assignments = get_shard_assignments(
-        command.model_card, selected_cycle, command.sharding, node_memory
+        command.model_card,
+        selected_cycle,
+        command.sharding,
+        node_memory,
+        replicate_attention=replicate_attention,
     )
 
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle.node_ids)
