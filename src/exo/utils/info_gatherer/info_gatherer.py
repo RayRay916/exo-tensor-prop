@@ -572,13 +572,29 @@ class InfoGatherer:
                         return
                     stream = BufferedByteReceiveStream(p.stdout)
                     while True:
-                        with fail_after(read_timeout):
-                            data = await stream.receive_until(
-                                delimiter=b"\n", max_bytes=8 * 1024
+                        try:
+                            with fail_after(read_timeout):
+                                data = await stream.receive_until(
+                                    delimiter=b"\n", max_bytes=8 * 1024
+                                )
+                                text = data.decode("utf-8", errors="replace").strip()
+                                metrics = MacmonMetrics.from_raw_json(text)
+                            await self.info_sender.send(metrics)
+                        except TimeoutError:
+                            logger.warning(
+                                f"macmon produced no output for {read_timeout}s; restarting"
                             )
-                            text = data.decode("utf-8", errors="replace").strip()
-                            metrics = MacmonMetrics.from_raw_json(text)
-                        await self.info_sender.send(metrics)
+                            break
+                        except (
+                            anyio.IncompleteRead,
+                            anyio.EndOfStream,
+                            anyio.ClosedResourceError,
+                            anyio.BrokenResourceError,
+                        ):
+                            logger.warning(
+                                "macmon stream closed mid-read; restarting macmon subprocess"
+                            )
+                            break
             except TimeoutError:
                 logger.warning(
                     f"MacMon produced no output for {read_timeout}s, restarting"
