@@ -1,3 +1,71 @@
+# exo-tensor-prop
+
+> A fork of [exo](https://github.com/exo-explore/exo) where tensor parallelism
+> **proportionally adapts to unequal and odd-numbered nodes**, instead of
+> splitting every weight into equal shards.
+
+Stock exo tensor-parallelism gives a 128 GB Mac Studio the same shard as a 64 GB
+MacBook Pro, so the cluster is bounded by its smallest node. This fork shards the
+MoE expert weights **proportionally to each node's memory budget** and replicates
+the small attention block — so a heterogeneous cluster's capacity becomes the
+*sum* of node budgets, not `min(node) × node_count`. Homogeneous clusters are
+untouched (the split detects "even" and takes the stock path).
+
+**→ How it works: [`docs/proportional-tp.md`](docs/proportional-tp.md)**
+**→ Run a cluster: [`deploy/`](deploy/README.md)**
+
+### What this fork adds on top of upstream
+
+| Area | Change |
+|---|---|
+| Proportional TP | Memory-weighted MoE expert sharding (`master/placement_utils.py`, `worker/engines/mlx/auto_parallel.py`) |
+| Attention | `EXO_TP_REPLICATE_ATTN` replicates attention when KV heads don't divide the node count |
+| Placement bias | `OVERRIDE_MEMORY_MB` caps a node's reported RAM on the macmon path |
+| Robustness | macmon stream-crash recovery (no more node drop-outs); Kimi-K2 tokenizer guard |
+| Runtime knobs | `EXO_KV_BITS` opt-in KV-cache quantization; thinking-off default; concurrency default |
+| Tooling | `deploy/` — config-driven N-node cluster bring-up (`exoprop`), all infra in a gitignored `cluster.env` |
+
+### Quickstart
+
+```bash
+# build the venv on every node (same as upstream)
+uv sync --extra mlx
+cd dashboard && npm install && npm run build && cd ..
+
+# bring up a heterogeneous tensor-parallel cluster
+cd deploy
+cp cluster.env.example cluster.env      # fill in your workers, ports, model ids
+./exoprop start                         # RAM-weighted split, or: --weights 128,64,64
+./exoprop start load <hf_model_id>      # place a model N-way
+```
+
+### Relationship to upstream / staying in sync
+
+Seeded at upstream **v0.3.70** (commit `667a3bb0`) — the exact version the
+proportional patch was written and validated against — with the full upstream
+history preserved. To pull upstream changes forward later:
+
+```bash
+git remote -v                  # `upstream` -> exo-explore/exo is already configured
+git fetch upstream
+git merge upstream/main        # resolve conflicts in placement_utils / auto_parallel
+```
+
+### Roadmap to production-ready
+
+This seed lays clean foundations; it is **not yet production-hardened**. Open items:
+
+- [ ] Forward-merge to current upstream `main` (~6 weeks of commits ahead of the base).
+- [ ] Tests for the proportional split (`_tensor_proportions`, `_aligned_segment_sizes`) — odd node counts, alignment edge cases, indivisible KV heads.
+- [ ] macOS CI job running the full `nix flake check` gate (basedpyright + pytest + rust); current CI is lint + byte-compile only.
+- [ ] Validate proportional sharding beyond the two target MoE models (dense models, other KV-head counts).
+- [ ] Upstreamable PR: factor the proportional path behind a clean flag and propose it to exo.
+
+This fork is licensed under Apache-2.0, the same as upstream exo. The upstream
+project's README follows below.
+
+---
+
 <div align="center">
 
 <picture>

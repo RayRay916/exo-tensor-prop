@@ -1,0 +1,29 @@
+name: fork-ci
+
+# Lightweight, runs-anywhere checks for the proportional-TP fork. The full
+# upstream gate (basedpyright + pytest + rust) is `nix flake check` on macOS —
+# see AGENTS.md. Wiring that as a macOS job is tracked in the README roadmap.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: ruff (pinned to the version the fork was validated against)
+        run: uvx ruff@0.14.11 check src/exo
+
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: byte-compile source
+        run: python -m compileall -q src/exo
