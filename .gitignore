@@ -40,3 +40,6 @@ bench/**/*.json
 tmp/models
 /build/exo
 /.claude/skills
+
+# exo-tensor-prop: local cluster config (never commit real infra)
+deploy/cluster.env

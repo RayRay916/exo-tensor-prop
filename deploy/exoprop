@@ -1,0 +1,142 @@
+#!/bin/bash
+# exoprop — manage the isolated N-node proportional tensor-parallel exo cluster.
+# All infra (workers, ports, model ids, binary path) comes from deploy/cluster.env.
+#
+#   exoprop start [--ram | --weights SPEC]   bring up the mesh (no model). No teardown.
+#   exoprop start 35b | 122b | assistant     ensure mesh up, then load that shortcut model
+#   exoprop start load <model_id> [meta]     ensure mesh up, then load any model N-way (meta default MlxRing)
+#   exoprop stop                             KILL ALL this-cluster exo processes on every node (+ tmux). Full nuke.
+#   exoprop down                             stop ONLY the prop instance (prop ports); leaves other exo clusters.
+#   exoprop status                           mesh + weight-mode + loaded models
+#   exoprop attach | logs                    attach tmux / tail master log
+#
+#   --ram           split sized by each node's available RAM (default)
+#   --weights SPEC  pin the split. SPEC = "128,64,64" (-> rank0..N) or "rank0:..,rank1:.."
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$HERE/cluster.env" ]; then . "$HERE/cluster.env"; else
+  echo "exoprop: $HERE/cluster.env missing (copy cluster.env.example -> cluster.env)"; exit 1
+fi
+
+SESSION=exoprop
+UP="$HERE/cluster-up.sh"
+WORKERS="${EXO_WORKERS:-}"
+MIN_NODES=$(( $(echo "$WORKERS" | wc -w) + 1 ))
+APORT="${EXO_PROP_API_PORT:-52416}"
+LPORT="${EXO_PROP_LIBP2P_PORT:-52417}"
+API="http://localhost:$APORT"
+EXO_BIN_RE="${EXO_BIN_RE:-exo-tensor-prop/[.]venv/bin/exo}"
+RUNLOG="$HOME/${EXO_PROP_HOME:-.exo-prop}/run.log"
+
+# exo-kill-all: stop ALL this-cluster exo processes on every node + tmux session.
+do_stop() {
+  tmux kill-session -t "$SESSION" 2>/dev/null
+  pkill -9 -f "$EXO_BIN_RE" 2>/dev/null
+  for h in $WORKERS; do
+    ssh -o BatchMode=yes "$h" "pkill -9 -f '$EXO_BIN_RE' 2>/dev/null" 2>/dev/null
+  done
+  echo "exoprop stop: killed this cluster's exo processes on master + $WORKERS (+ tmux '$SESSION')"
+}
+
+# prop-only stop: port-scoped (prop ports); leaves other exo clusters alone.
+_kill_local()  { for p in "$APORT" "$LPORT"; do lsof -ti :"$p" 2>/dev/null | xargs kill -9 2>/dev/null; done; }
+_kill_remote() { ssh -o BatchMode=yes "$1" "for p in $APORT $LPORT; do lsof -ti :\$p 2>/dev/null | xargs kill -9 2>/dev/null; done" 2>/dev/null; }
+do_down() {
+  tmux kill-session -t "$SESSION" 2>/dev/null
+  _kill_local; for h in $WORKERS; do _kill_remote "$h"; done
+  echo "exoprop down: stopped prop instance ($APORT/$LPORT); other clusters untouched"
+}
+
+# bring up the mesh (executables + wrappers). Separate from stop; does NOT teardown.
+do_start() {
+  local mode=ram spec=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ram)     mode=ram; shift ;;
+      --weights) mode=weights; spec="${2:-}"; shift 2 ;;
+      *) echo "exoprop start: unknown option '$1'"; return 2 ;;
+    esac
+  done
+  # Liveness = the master ACTUALLY listening on the API port (not merely a tmux
+  # session). cluster-up.sh blocks in `wait` on the worker SSH conns, so its tmux
+  # session lingers even if the local master crashed. Port up = genuinely up.
+  if lsof -nP -iTCP:"$APORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "exoprop start: mesh already up (run 'exoprop stop' or 'exoprop down' first to restart)"; return 0
+  fi
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    if pgrep -f "$EXO_BIN_RE --api-port $APORT" >/dev/null 2>&1; then
+      echo "exoprop start: mesh still forming (master up, :$APORT not yet listening) — wait ~30s, then: exoprop status"; return 0
+    fi
+    echo "exoprop start: stale session (master crashed, :$APORT down) — cleaning up and restarting..."
+    do_stop; sleep 2
+  fi
+  if [ "$mode" = weights ]; then
+    [ -z "$spec" ] && { echo "exoprop start: --weights needs a SPEC (e.g. 128,64,64)"; return 2; }
+    case "$spec" in
+      *:*) : ;;
+      *) spec=$(printf '%s' "$spec" | awk -F, '{for(i=1;i<=NF;i++) printf "%srank%d:%s",(i>1?",":""),i-1,$i}') ;;
+    esac
+    tmux new-session -d -s "$SESSION" "bash '$UP' --weights '$spec'"
+    echo "exoprop start: bringing up mesh, pinned EXO_NODE_WEIGHTS=$spec (tmux: $SESSION)"
+  else
+    tmux new-session -d -s "$SESSION" "bash '$UP'"
+    echo "exoprop start: bringing up mesh, RAM-weighted (tmux: $SESSION)"
+  fi
+  echo "  ~40s to form the ${MIN_NODES}-node mesh, then: exoprop status   (load with: exoprop start 35b)"
+}
+
+# start a model instance (place N-way). Ensures mesh up first via do_start.
+do_load() {
+  local model="$1"; local meta="${2:-MlxRing}"
+  [ -z "$model" ] && { echo "exoprop start load: need a model_id"; return 2; }
+  if ! lsof -nP -iTCP:"$APORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "exoprop: mesh not up - bringing it up first..."; do_start; echo "  waiting ~40s for mesh..."; sleep 40
+  fi
+  local d=/tmp/exoprop; mkdir -p "$d"
+  echo "exoprop: starting instance '$model' as ${MIN_NODES}-way Tensor ($meta)..."
+  curl -s -m 30 "$API/instance/placement?model_id=$model&sharding=Tensor&instance_meta=$meta&min_nodes=$MIN_NODES" -o "$d/place.json"
+  if grep -q '"error"' "$d/place.json" 2>/dev/null; then echo "  placement rejected:"; sed 's/^/    /' "$d/place.json"; echo; return 1; fi
+  python3 -c "import json; json.dump({'instance':json.load(open('$d/place.json'))}, open('$d/create.json','w'))" 2>/dev/null || { echo "  failed to build request"; return 1; }
+  curl -s -m 60 -X POST -H 'Content-Type: application/json' -d @"$d/create.json" "$API/instance" -o "$d/inst.json"
+  if grep -q '"error"' "$d/inst.json" 2>/dev/null; then echo "  create rejected:"; sed 's/^/    /' "$d/inst.json"; echo; return 1; fi
+  echo "  instance created; loading across $MIN_NODES nodes (large models take minutes)."
+  echo "  progress: exoprop logs   |   state: exoprop status"
+}
+
+do_status() {
+  printf 'tmux:    '; tmux ls 2>/dev/null | grep "^$SESSION:" || echo '(no session)'
+  printf 'master:  '; lsof -nP -iTCP:"$APORT" -sTCP:LISTEN >/dev/null 2>&1 && echo "LISTENING :$APORT" || echo 'down'
+  printf 'mesh:    %s established conns (master)\n' "$(lsof -i :"$LPORT" -nP 2>/dev/null | grep -c ESTABLISHED)"
+  local m; m=$(lsof -nP -iTCP:"$APORT" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p' | head -1)
+  if [ -n "$m" ]; then
+    local nw; nw=$(ps eww "$m" 2>/dev/null | tr ' ' '\n' | grep '^EXO_NODE_WEIGHTS=')
+    [ -n "$nw" ] && echo "weights: $nw" || echo 'weights: RAM-derived (EXO_NODE_WEIGHTS unset)'
+  fi
+  printf 'models:  '; curl -s -m 8 "$API/v1/models" 2>/dev/null | grep -o '"id":"[^"]*"' | sed 's/"id":"//;s/"$//' | paste -sd',' - || echo '(api down)'
+}
+
+case "${1:-status}" in
+  start)
+    shift
+    case "${1:-}" in
+      35b)       do_load "${MODEL_35B:?set MODEL_35B in cluster.env}" ;;
+      122b)      do_load "${MODEL_122B:?set MODEL_122B in cluster.env}" ;;
+      assistant) do_load "${MODEL_ASSISTANT:?set MODEL_ASSISTANT in cluster.env}" ;;
+      load)      shift; do_load "$@" ;;
+      ""|--ram|--weights) do_start "$@" ;;
+      *) echo "exoprop start: unknown target '$1' (use: 35b | 122b | assistant | load <id> | --ram | --weights SPEC)"; exit 2 ;;
+    esac
+    ;;
+  stop)             do_stop ;;
+  down)             do_down ;;
+  status)           do_status ;;
+  attach)           exec tmux attach -t "$SESSION" ;;
+  logs)             exec tail -n 40 -f "$RUNLOG" ;;
+  up)        shift; do_start "$@" ;;
+  35b)              do_load "${MODEL_35B:?set MODEL_35B in cluster.env}" ;;
+  122b)             do_load "${MODEL_122B:?set MODEL_122B in cluster.env}" ;;
+  assistant)        do_load "${MODEL_ASSISTANT:?set MODEL_ASSISTANT in cluster.env}" ;;
+  load)      shift; do_load "$@" ;;
+  -h|--help|help)   sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "usage: exoprop {start [--ram|--weights SPEC] | start 35b|122b|assistant|load <id> | stop | down | status | attach | logs}"; exit 2 ;;
+esac
