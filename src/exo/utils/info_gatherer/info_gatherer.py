@@ -557,7 +557,13 @@ class InfoGatherer:
         # Timeout: if macmon produces no output for this many seconds, restart it.
         # macmon writes every macmon_interval seconds, so 10x that is generous.
         read_timeout = max(macmon_interval * 10, 30)
+        # Backoff between macmon restarts: reset once it delivers metrics, grow
+        # on consecutive failures so a binary that crashes on launch can't
+        # hot-respawn in a tight loop.
+        backoff = macmon_interval
+        max_backoff = max(macmon_interval * 30, 60.0)
         while True:
+            produced_output = False
             try:
                 async with await open_process(
                     [
@@ -580,6 +586,7 @@ class InfoGatherer:
                                 text = data.decode("utf-8", errors="replace").strip()
                                 metrics = MacmonMetrics.from_raw_json(text)
                             await self.info_sender.send(metrics)
+                            produced_output = True
                         except TimeoutError:
                             logger.warning(
                                 f"macmon produced no output for {read_timeout}s; restarting"
@@ -616,4 +623,5 @@ class InfoGatherer:
             except Exception as e:
                 logger.opt(exception=e).warning("Error in macmon monitor")
                 self._tg.start_soon(self._monitor_memory_usage, 1)
-            await anyio.sleep(macmon_interval)
+            backoff = macmon_interval if produced_output else min(backoff * 2, max_backoff)
+            await anyio.sleep(backoff)

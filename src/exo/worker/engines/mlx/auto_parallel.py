@@ -64,6 +64,10 @@ from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
+from exo.worker.engines.mlx.sharding_math import (
+    aligned_segment_sizes,
+    shard_axis_bounds,
+)
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -454,52 +458,46 @@ def patch_tensor_model[T](model: T) -> T:
     return model
 
 
-def _aligned_segment_sizes(
-    dim: int, proportions: list[float], align: int
-) -> list[int]:
-    """Split ``dim`` into ``len(proportions)`` integer parts, each a multiple of
-    ``align``, approximating ``proportions`` and summing exactly to ``dim``.
+def _quant_group_align(module: nn.Module) -> int:
+    """Required split alignment for ``module`` along its sharded dimension.
 
-    Largest-remainder rounding; every part is forced to at least one
-    ``align``-sized unit so no rank gets an empty shard.
+    For a quantized linear the scales/biases are grouped along the contraction
+    axis, so an uneven split must land on ``group_size`` boundaries or the
+    sliced scales no longer line up with the packed weight — silent corruption,
+    no crash. Detect quantization by the presence of ``scales`` and demand a
+    real ``group_size``; never silently fall back to element alignment. A plain
+    (non-quantized) linear has no such constraint, so it returns 1.
     """
-    if align < 1:
-        align = 1
-    assert dim % align == 0, f"dim {dim} is not a multiple of align {align}"
-    units = dim // align
-    n = len(proportions)
-    if units < n:
-        raise ValueError(f"cannot split {units} units across {n} ranks")
-    raw = [p * units for p in proportions]
-    sizes = [int(r) for r in raw]
-    leftover = units - sum(sizes)
-    for idx in sorted(range(n), key=lambda i: raw[i] - sizes[i], reverse=True):
-        if leftover <= 0:
-            break
-        sizes[idx] += 1
-        leftover -= 1
-    for i in range(n):
-        if sizes[i] == 0:
-            donor = max(range(n), key=lambda k: sizes[k])
-            assert sizes[donor] > 1
-            sizes[donor] -= 1
-            sizes[i] = 1
-    return [s * align for s in sizes]
+    params = module.parameters()
+    is_quantized = isinstance(params, dict) and "scales" in params
+    group_size = int(getattr(module, "group_size", 0) or 0)
+    if is_quantized:
+        if group_size < 1:
+            raise ValueError(
+                f"quantized module {type(module).__name__} exposes no usable "
+                "group_size; cannot compute an aligned uneven tensor split"
+            )
+        return group_size
+    return max(group_size, 1)
 
 
 def _shard_module_uneven(
     module: nn.Module,
     sharding: Literal["all-to-sharded", "sharded-to-all"],
-    start_frac: float,
-    end_frac: float,
+    start_unit: int,
+    end_unit: int,
+    total_units: int,
     world_size: int,
 ) -> None:
     """In-place uneven analogue of mlx ``shard_inplace``.
 
     Each parameter array is sliced along its sharded axis to the half-open
-    fractional window ``[start_frac, end_frac)``. The fractional cut points are
-    derived from quant-group-aligned segment sizes, so the integer boundaries
-    land cleanly on every parameter array (packed weight, scales, biases).
+    window covering logical units ``[start_unit, end_unit)`` out of
+    ``total_units``. Boundaries are mapped to each array's actual axis length
+    with **integer** arithmetic (``unit * dim // total_units``) and asserted to
+    divide evenly, so the packed weight and its scales/biases — whose axis
+    lengths differ for quantized layers — always land on the same logical cut.
+    Using floats here risked inconsistent rounding and silent corruption.
     """
 
     def _shard_fn(path: str, arr: object) -> object:
@@ -517,8 +515,7 @@ def _shard_module_uneven(
         else:  # sharded-to-all
             axis = arr.ndim - 1
         dim = arr.shape[axis]
-        start = round(start_frac * dim)
-        end = round(end_frac * dim)
+        start, end = shard_axis_bounds(start_unit, end_unit, total_units, dim)
         return mx.contiguous(mx.split(arr, [start, end], axis=axis)[1])
 
     module.update(tree_map_with_path(_shard_fn, module.parameters()))
@@ -528,6 +525,7 @@ def tensor_auto_parallel(
     model: nn.Module,
     group: mx.distributed.Group,
     proportions: list[float] | None = None,
+    replicate_attention: bool = False,
 ) -> Generator[ModelLoadingResponse, None, nn.Module]:
     all_to_sharded_linear = partial(
         shard_linear,
@@ -635,6 +633,7 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
             proportions,
+            replicate_attention,
         )
     elif isinstance(model, GptOssModel):
         tensor_parallel_sharding_strategy = GptOssShardingStrategy(
@@ -684,6 +683,7 @@ class TensorParallelShardingStrategy(ABC):
         all_to_sharded_linear_in_place: Callable[..., None],
         sharded_to_all_linear_in_place: Callable[..., None],
         proportions: list[float] | None = None,
+        replicate_attention: bool = False,
     ):
         self.all_to_sharded_linear = all_to_sharded_linear
         self.sharded_to_all_linear = sharded_to_all_linear
@@ -693,6 +693,8 @@ class TensorParallelShardingStrategy(ABC):
         self.N = group.size()
         # Per-rank dimension shares for uneven tensor sharding; None => even.
         self.proportions = proportions
+        # Replicate attention, shard only experts (decided at placement).
+        self.replicate_attention = replicate_attention
 
     @abstractmethod
     def shard_model(
@@ -1217,21 +1219,36 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
         assert isinstance(weight, mx.array)
         # gate/up output dim == down input dim == the expert intermediate size.
         intermediate = weight.shape[-2]
-        align = int(getattr(gate_proj, "group_size", 0) or 1)
-        seg = _aligned_segment_sizes(intermediate, self.proportions, align)
+        align = _quant_group_align(gate_proj)
+        seg = aligned_segment_sizes(intermediate, self.proportions, align)
         offsets = [sum(seg[:k]) for k in range(len(seg) + 1)]
         rank = self.group.rank()
-        start_frac = offsets[rank] / intermediate
-        end_frac = offsets[rank + 1] / intermediate
+        start_unit = offsets[rank]
+        end_unit = offsets[rank + 1]
 
         _shard_module_uneven(
-            experts.gate_proj, "all-to-sharded", start_frac, end_frac, self.N
+            experts.gate_proj,
+            "all-to-sharded",
+            start_unit,
+            end_unit,
+            intermediate,
+            self.N,
         )
         _shard_module_uneven(
-            experts.up_proj, "all-to-sharded", start_frac, end_frac, self.N
+            experts.up_proj,
+            "all-to-sharded",
+            start_unit,
+            end_unit,
+            intermediate,
+            self.N,
         )
         _shard_module_uneven(
-            experts.down_proj, "sharded-to-all", start_frac, end_frac, self.N
+            experts.down_proj,
+            "sharded-to-all",
+            start_unit,
+            end_unit,
+            intermediate,
+            self.N,
         )
 
     def shard_model(
@@ -1247,12 +1264,12 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
             | Qwen3VLModel,
             model,
         )
-        import os
-        replicate_attn = bool(os.environ.get("EXO_TP_REPLICATE_ATTN"))
+        replicate_attn = self.replicate_attention
         total = len(model.layers)
         for i, layer in enumerate(model.layers):
             mx.eval(layer.parameters())
-            # Shard the self attention (replicate when EXO_TP_REPLICATE_ATTN set)
+            # Shard the self attention (replicate when replicate_attention set
+            # at placement and carried in the shard metadata).
             if replicate_attn:
                 pass
             elif isinstance(layer, (Qwen3MoeDecoderLayer, Qwen3TransformerBlock)):

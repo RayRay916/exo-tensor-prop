@@ -80,6 +80,11 @@ class TensorShardMetadata(BaseShardMetadata):
     # None => even split across world_size (the default). Set when nodes have
     # unequal memory so the larger node carries a proportionally larger shard.
     proportions: list[float] | None = None
+    # Replicate the attention block on every rank and shard only the MoE
+    # experts. Decided once at placement (from EXO_TP_REPLICATE_ATTN on the
+    # master) and carried here so the worker doesn't re-read the env — the two
+    # hosts must agree or placement and sharding diverge.
+    replicate_attention: bool = False
 
 
 ShardMetadata: TypeAlias = (

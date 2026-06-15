@@ -263,7 +263,10 @@ def shard_and_load(
         case TensorShardMetadata():
             logger.info(f"loading model from {model_path} with tensor parallelism")
             model = yield from tensor_auto_parallel(
-                model, group, shard_metadata.proportions
+                model,
+                group,
+                shard_metadata.proportions,
+                shard_metadata.replicate_attention,
             )
         case PipelineShardMetadata():
             logger.info(f"loading model from {model_path} with pipeline parallelism")
