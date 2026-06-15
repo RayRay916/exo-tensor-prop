@@ -106,6 +106,7 @@ def place_instance(
     required_nodes: set[NodeId] | None = None,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
 ) -> dict[InstanceId, Instance]:
+    import os
     cycles = topology.get_cycles()
     candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
 
@@ -136,8 +137,8 @@ def place_instance(
         cycles_with_sufficient_memory = [
             cycle
             for cycle in cycles_with_sufficient_memory
-            if command.model_card.hidden_size % len(cycle) == 0
-            and (is_deepseek_v4 or kv_heads is None or kv_heads % len(cycle) == 0)
+            if (command.model_card.hidden_size % len(cycle) == 0 or os.environ.get("EXO_TP_REPLICATE_ATTN"))
+            and (is_deepseek_v4 or kv_heads is None or kv_heads % len(cycle) == 0 or os.environ.get("EXO_TP_REPLICATE_ATTN"))
         ]
         if not cycles_with_sufficient_memory:
             raise ValueError(

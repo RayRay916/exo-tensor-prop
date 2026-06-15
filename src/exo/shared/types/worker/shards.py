@@ -76,7 +76,10 @@ class CfgShardMetadata(BaseShardMetadata):
 
 @final
 class TensorShardMetadata(BaseShardMetadata):
-    pass
+    # Per-rank share of each tensor-sharded dimension, indexed by device_rank.
+    # None => even split across world_size (the default). Set when nodes have
+    # unequal memory so the larger node carries a proportionally larger shard.
+    proportions: list[float] | None = None
 
 
 ShardMetadata: TypeAlias = (

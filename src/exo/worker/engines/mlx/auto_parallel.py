@@ -11,6 +11,7 @@ from mlx.nn.layers.distributed import (
     shard_linear,
     sum_gradients,
 )
+from mlx.utils import tree_map_with_path
 from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
@@ -453,9 +454,80 @@ def patch_tensor_model[T](model: T) -> T:
     return model
 
 
+def _aligned_segment_sizes(
+    dim: int, proportions: list[float], align: int
+) -> list[int]:
+    """Split ``dim`` into ``len(proportions)`` integer parts, each a multiple of
+    ``align``, approximating ``proportions`` and summing exactly to ``dim``.
+
+    Largest-remainder rounding; every part is forced to at least one
+    ``align``-sized unit so no rank gets an empty shard.
+    """
+    if align < 1:
+        align = 1
+    assert dim % align == 0, f"dim {dim} is not a multiple of align {align}"
+    units = dim // align
+    n = len(proportions)
+    if units < n:
+        raise ValueError(f"cannot split {units} units across {n} ranks")
+    raw = [p * units for p in proportions]
+    sizes = [int(r) for r in raw]
+    leftover = units - sum(sizes)
+    for idx in sorted(range(n), key=lambda i: raw[i] - sizes[i], reverse=True):
+        if leftover <= 0:
+            break
+        sizes[idx] += 1
+        leftover -= 1
+    for i in range(n):
+        if sizes[i] == 0:
+            donor = max(range(n), key=lambda k: sizes[k])
+            assert sizes[donor] > 1
+            sizes[donor] -= 1
+            sizes[i] = 1
+    return [s * align for s in sizes]
+
+
+def _shard_module_uneven(
+    module: nn.Module,
+    sharding: Literal["all-to-sharded", "sharded-to-all"],
+    start_frac: float,
+    end_frac: float,
+    world_size: int,
+) -> None:
+    """In-place uneven analogue of mlx ``shard_inplace``.
+
+    Each parameter array is sliced along its sharded axis to the half-open
+    fractional window ``[start_frac, end_frac)``. The fractional cut points are
+    derived from quant-group-aligned segment sizes, so the integer boundaries
+    land cleanly on every parameter array (packed weight, scales, biases).
+    """
+
+    def _shard_fn(path: str, arr: object) -> object:
+        if not isinstance(arr, mx.array):
+            return arr
+        if path.endswith("bias"):
+            # Additive bias: sliced with the output for all-to-sharded;
+            # replicated-then-prescaled for sharded-to-all (the following
+            # all_sum would otherwise add it world_size times).
+            if sharding == "sharded-to-all":
+                return arr / world_size
+            axis = arr.ndim - 1
+        elif sharding == "all-to-sharded":
+            axis = max(arr.ndim - 2, 0)
+        else:  # sharded-to-all
+            axis = arr.ndim - 1
+        dim = arr.shape[axis]
+        start = round(start_frac * dim)
+        end = round(end_frac * dim)
+        return mx.contiguous(mx.split(arr, [start, end], axis=axis)[1])
+
+    module.update(tree_map_with_path(_shard_fn, module.parameters()))
+
+
 def tensor_auto_parallel(
     model: nn.Module,
     group: mx.distributed.Group,
+    proportions: list[float] | None = None,
 ) -> Generator[ModelLoadingResponse, None, nn.Module]:
     all_to_sharded_linear = partial(
         shard_linear,
@@ -562,6 +634,7 @@ def tensor_auto_parallel(
             sharded_to_all_linear,
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
+            proportions,
         )
     elif isinstance(model, GptOssModel):
         tensor_parallel_sharding_strategy = GptOssShardingStrategy(
@@ -610,6 +683,7 @@ class TensorParallelShardingStrategy(ABC):
         sharded_to_all_linear: Callable[..., nn.Linear],
         all_to_sharded_linear_in_place: Callable[..., None],
         sharded_to_all_linear_in_place: Callable[..., None],
+        proportions: list[float] | None = None,
     ):
         self.all_to_sharded_linear = all_to_sharded_linear
         self.sharded_to_all_linear = sharded_to_all_linear
@@ -617,6 +691,8 @@ class TensorParallelShardingStrategy(ABC):
         self.sharded_to_all_linear_in_place = sharded_to_all_linear_in_place
         self.group = group
         self.N = group.size()
+        # Per-rank dimension shares for uneven tensor sharding; None => even.
+        self.proportions = proportions
 
     @abstractmethod
     def shard_model(
@@ -1119,6 +1195,45 @@ class MiniMaxShardingStrategy(TensorParallelShardingStrategy):
 
 
 class QwenShardingStrategy(TensorParallelShardingStrategy):
+    def _shard_experts(self, experts: nn.Module) -> None:
+        """Shard a gate/up/down expert module (routed switch_mlp or the
+        shared_expert) across ranks.
+
+        With ``self.proportions`` set, the expert intermediate dimension is
+        split unevenly, quant-group aligned; otherwise the default even split
+        is used. gate_proj/up_proj are column-parallel (all-to-sharded) and
+        down_proj is row-parallel (sharded-to-all). The surrounding ShardedMoE
+        wrapper performs the all_sum, so any consistent split of the
+        intermediate dimension is numerically correct.
+        """
+        if self.proportions is None:
+            self.all_to_sharded_linear_in_place(experts.gate_proj)
+            self.sharded_to_all_linear_in_place(experts.down_proj)
+            self.all_to_sharded_linear_in_place(experts.up_proj)
+            return
+
+        gate_proj = experts.gate_proj
+        weight = gate_proj["weight"]
+        assert isinstance(weight, mx.array)
+        # gate/up output dim == down input dim == the expert intermediate size.
+        intermediate = weight.shape[-2]
+        align = int(getattr(gate_proj, "group_size", 0) or 1)
+        seg = _aligned_segment_sizes(intermediate, self.proportions, align)
+        offsets = [sum(seg[:k]) for k in range(len(seg) + 1)]
+        rank = self.group.rank()
+        start_frac = offsets[rank] / intermediate
+        end_frac = offsets[rank + 1] / intermediate
+
+        _shard_module_uneven(
+            experts.gate_proj, "all-to-sharded", start_frac, end_frac, self.N
+        )
+        _shard_module_uneven(
+            experts.up_proj, "all-to-sharded", start_frac, end_frac, self.N
+        )
+        _shard_module_uneven(
+            experts.down_proj, "sharded-to-all", start_frac, end_frac, self.N
+        )
+
     def shard_model(
         self,
         model: nn.Module,
@@ -1132,11 +1247,15 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
             | Qwen3VLModel,
             model,
         )
+        import os
+        replicate_attn = bool(os.environ.get("EXO_TP_REPLICATE_ATTN"))
         total = len(model.layers)
         for i, layer in enumerate(model.layers):
             mx.eval(layer.parameters())
-            # Shard the self attention
-            if isinstance(layer, (Qwen3MoeDecoderLayer, Qwen3TransformerBlock)):
+            # Shard the self attention (replicate when EXO_TP_REPLICATE_ATTN set)
+            if replicate_attn:
+                pass
+            elif isinstance(layer, (Qwen3MoeDecoderLayer, Qwen3TransformerBlock)):
                 layer.self_attn.q_proj = self.all_to_sharded_linear(
                     layer.self_attn.q_proj
                 )
@@ -1254,19 +1373,11 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
                     Qwen3_5SparseMoeBlock,
                 ),
             ):
-                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
-                self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
-                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
+                self._shard_experts(layer.mlp.switch_mlp)
                 if isinstance(
                     layer.mlp, (Qwen3NextSparseMoeBlock, Qwen3_5SparseMoeBlock)
                 ):
-                    self.all_to_sharded_linear_in_place(
-                        layer.mlp.shared_expert.gate_proj
-                    )
-                    self.sharded_to_all_linear_in_place(
-                        layer.mlp.shared_expert.down_proj
-                    )
-                    self.all_to_sharded_linear_in_place(layer.mlp.shared_expert.up_proj)
+                    self._shard_experts(layer.mlp.shared_expert)
                 layer.mlp = ShardedMoE(layer.mlp)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
                 layer.mlp.sharding_group = self.group
 

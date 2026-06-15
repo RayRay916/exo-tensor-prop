@@ -262,7 +262,9 @@ def shard_and_load(
     match shard_metadata:
         case TensorShardMetadata():
             logger.info(f"loading model from {model_path} with tensor parallelism")
-            model = yield from tensor_auto_parallel(model, group)
+            model = yield from tensor_auto_parallel(
+                model, group, shard_metadata.proportions
+            )
         case PipelineShardMetadata():
             logger.info(f"loading model from {model_path} with pipeline parallelism")
             model = yield from pipeline_auto_parallel(model, group, shard_metadata)
@@ -294,7 +296,7 @@ def get_tokenizer(model_path: Path, shard_metadata: ShardMetadata) -> TokenizerW
     )
 
 
-def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
+def get_eos_token_ids_for_model(model_id: ModelId, model_path: Path | None = None) -> list[int] | None:
     """
     Get the EOS token IDs for a model based on its ID.
 
@@ -308,7 +310,7 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
         List of EOS token IDs, or None if the model uses standard tokenizer config
     """
     model_id_lower = model_id.lower()
-    if "kimi-k2" in model_id_lower:
+    if "kimi-k2" in model_id_lower and (model_path is None or (model_path / "tokenization_kimi.py").exists()):
         return [163586]
     elif "glm-5" in model_id_lower or "glm-4.7" in model_id_lower:
         # For GLM-5 and GLM-4.7
@@ -349,10 +351,10 @@ def load_tokenizer_for_model_id(
         TokenizerWrapper instance configured for the model
     """
     model_id_lower = model_id.lower()
-    eos_token_ids = get_eos_token_ids_for_model(model_id)
+    eos_token_ids = get_eos_token_ids_for_model(model_id, model_path)
 
     # Kimi uses a custom TikTokenTokenizer that transformers 5.x can't load via AutoTokenizer
-    if "kimi-k2" in model_id_lower:
+    if "kimi-k2" in model_id_lower and (model_path / "tokenization_kimi.py").exists():
         import importlib.util
         import types
 
@@ -619,11 +621,11 @@ def render_chat_template(
                     msg["thinking"] = rc
 
     extra_kwargs: dict[str, Any] = {}
-    if task_params.enable_thinking is not None:
-        # Qwen3 and GLM use "enable_thinking"; DeepSeek uses "thinking".
-        # Jinja ignores unknown variables, so passing both is safe.
-        extra_kwargs["enable_thinking"] = task_params.enable_thinking
-        extra_kwargs["thinking"] = task_params.enable_thinking
+    # exo-patch: default thinking OFF when the request omits it. mlx_lm's
+    # TokenizerWrapper otherwise injects enable_thinking=has_thinking (True).
+    _et = task_params.enable_thinking if task_params.enable_thinking is not None else False
+    extra_kwargs["enable_thinking"] = _et
+    extra_kwargs["thinking"] = _et
     if task_params.reasoning_effort is not None:
         extra_kwargs["reasoning_effort"] = task_params.reasoning_effort
 

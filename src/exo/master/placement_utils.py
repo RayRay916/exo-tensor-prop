@@ -1,3 +1,4 @@
+import os
 from collections.abc import Generator, Mapping
 
 from loguru import logger
@@ -240,16 +241,96 @@ def _get_shard_assignments_for_pure_pipeline(
     )
 
 
+def _parse_node_weights_env() -> dict[str, float]:
+    """Parse the EXO_NODE_WEIGHTS env var.
+
+    Format: 'key1:weight1,key2:weight2,...' where key is either a cycle-position
+    key ('rank0', 'rank1', ...) or a substring of a node UUID. Weights are
+    normalised later, so they need not sum to 1.0.
+
+    Example: EXO_NODE_WEIGHTS='rank0:0.80,rank1:0.20'
+    """
+    raw = os.environ.get("EXO_NODE_WEIGHTS", "").strip()
+    if not raw:
+        return {}
+    out: dict[str, float] = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        key, val = pair.rsplit(":", 1)
+        try:
+            out[key.strip()] = float(val)
+        except ValueError:
+            continue
+    return out
+
+
+def _tensor_proportions(
+    node_ids: list[NodeId],
+    node_memory: Mapping[NodeId, MemoryUsage],
+) -> list[float]:
+    """Per-rank weight share for tensor sharding, indexed by cycle position.
+
+    Uses EXO_NODE_WEIGHTS when set (rank-key or UUID-substring match), else
+    falls back to each node's available RAM. Always returns a normalised list
+    summing to 1.0.
+    """
+    env = _parse_node_weights_env()
+    raw: list[float] = []
+    for i, node_id in enumerate(node_ids):
+        w: float | None = None
+        nid = str(node_id)
+        for key, val in env.items():
+            if not key.startswith("rank") and key in nid:
+                w = val
+                break
+        if w is None:
+            w = env.get(f"rank{i}")
+        if w is None:
+            w = float(node_memory[node_id].ram_available.in_bytes)
+        raw.append(max(w, 0.0))
+
+    total = sum(raw)
+    if total <= 0:
+        return [1.0 / len(node_ids)] * len(node_ids)
+    return [w / total for w in raw]
+
+
 def get_shard_assignments_for_tensor_parallel(
     model_card: ModelCard,
     cycle: Cycle,
-):
+    node_memory: Mapping[NodeId, MemoryUsage],
+) -> ShardAssignments:
+    _validate_cycle(cycle)
     total_layers = model_card.n_layers
-    world_size = len(cycle)
+    node_ids = cycle.node_ids
+    world_size = len(node_ids)
+
+    proportions = _tensor_proportions(node_ids, node_memory)
+    # If the split is (near) even, leave proportions unset so workers take the
+    # original even code path — keeps behaviour bit-identical for equal nodes.
+    even = all(abs(p - 1.0 / world_size) < 1e-6 for p in proportions)
+
+    # Validate each node can hold its shard. Approximate: the MoE experts
+    # dominate an 80B-A3B's weight and are sharded by `proportions`, so a
+    # node's footprint tracks its proportion (attention stays even but is
+    # comparatively small). Fails here rather than OOMing mid-inference.
+    total_storage_bytes = model_card.storage_size.in_bytes
+    for i, node_id in enumerate(node_ids):
+        required = int(total_storage_bytes * proportions[i])
+        available = node_memory[node_id].ram_available.in_bytes
+        if required > available:
+            raise ValueError(
+                f"Node {i} ({node_id}) has insufficient memory for its tensor "
+                f"shard: requires ~{required / 1e9:.2f} GB "
+                f"(proportion {proportions[i]:.3f}) but only "
+                f"{available / 1e9:.2f} GB available"
+            )
+
     runner_to_shard: dict[RunnerId, ShardMetadata] = {}
     node_to_runner: dict[NodeId, RunnerId] = {}
 
-    for i, node_id in enumerate(cycle):
+    for i, node_id in enumerate(node_ids):
         shard = TensorShardMetadata(
             model_card=model_card,
             device_rank=i,
@@ -257,6 +338,7 @@ def get_shard_assignments_for_tensor_parallel(
             start_layer=0,
             end_layer=total_layers,
             n_layers=total_layers,
+            proportions=None if even else proportions,
         )
 
         runner_id = RunnerId()
@@ -264,13 +346,14 @@ def get_shard_assignments_for_tensor_parallel(
         runner_to_shard[runner_id] = shard
         node_to_runner[node_id] = runner_id
 
-    shard_assignments = ShardAssignments(
+    if not even:
+        logger.info(f"Tensor-parallel uneven shard proportions: {proportions}")
+
+    return ShardAssignments(
         model_id=model_card.model_id,
         runner_to_shard=runner_to_shard,
         node_to_runner=node_to_runner,
     )
-
-    return shard_assignments
 
 
 def get_shard_assignments(
@@ -290,6 +373,7 @@ def get_shard_assignments(
             return get_shard_assignments_for_tensor_parallel(
                 model_card=model_card,
                 cycle=cycle,
+                node_memory=node_memory,
             )
 
 

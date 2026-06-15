@@ -1,7 +1,9 @@
+import os
 from typing import Self
 
 from pydantic import BaseModel
 
+from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import MemoryUsage, SystemPerformanceProfile
 from exo.utils.pydantic_ext import TaggedModel
 
@@ -43,12 +45,31 @@ class RawMacmonMetrics(BaseModel, extra="ignore"):
     sys_power: float
 
 
+def _maybe_override_ram_available(default_bytes: int) -> int:
+    """If OVERRIDE_MEMORY_MB is set, cap ram_available to that value.
+
+    Mirrors the override that already exists on the psutil fallback path
+    (see info_gatherer._monitor_memory_usage), so layer placement weights
+    can be biased on macOS without disabling macmon.
+    """
+    env = os.getenv("OVERRIDE_MEMORY_MB")
+    if not env:
+        return default_bytes
+    try:
+        return Memory.from_mb(int(env)).in_bytes
+    except (TypeError, ValueError):
+        return default_bytes
+
+
 class MacmonMetrics(TaggedModel):
     system_profile: SystemPerformanceProfile
     memory: MemoryUsage
 
     @classmethod
     def from_raw(cls, raw: RawMacmonMetrics) -> Self:
+        ram_available = _maybe_override_ram_available(
+            raw.memory.ram_total - raw.memory.ram_usage
+        )
         return cls(
             system_profile=SystemPerformanceProfile(
                 gpu_usage=raw.gpu_usage[1],
@@ -59,7 +80,7 @@ class MacmonMetrics(TaggedModel):
             ),
             memory=MemoryUsage.from_bytes(
                 ram_total=raw.memory.ram_total,
-                ram_available=(raw.memory.ram_total - raw.memory.ram_usage),
+                ram_available=ram_available,
                 swap_total=raw.memory.swap_total,
                 swap_available=(raw.memory.swap_total - raw.memory.swap_usage),
             ),
