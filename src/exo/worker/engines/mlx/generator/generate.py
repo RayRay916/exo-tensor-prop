@@ -374,16 +374,46 @@ def prefill(
 
     # stream_generate added 1 extra generated token to the cache, so we should trim it.
     # Because of needing to roll back arrays cache, we will generate on 2 tokens so trim 1 more.
-    pre_gen = snapshots[-2] if has_ssm else None
+    # Guard: mlx-lm's prompt_progress_callback may be called only once for short prompts
+    # (< prefill_step_size tokens), giving len(snapshots)==1. In that case fall back to
+    # snapshots[0] so we don't crash with IndexError — the restored state will be
+    # off by one decode step but is far better than aborting warmup entirely.
+    if has_ssm:
+        if len(snapshots) >= 2:
+            pre_gen = snapshots[-2]
+        elif len(snapshots) == 1:
+            logger.warning(
+                "Only 1 SSM snapshot captured during prefill (expected ≥2); "
+                "using snapshots[0] for cache restoration — cache position may be off by 1"
+            )
+            pre_gen = snapshots[0]
+        else:
+            logger.warning(
+                "No SSM snapshots captured during prefill; "
+                "SSM cache state will not be restored"
+            )
+            pre_gen = None
+    else:
+        pre_gen = None
+
     for i, c in enumerate(cache):
         non_trimmable = is_non_trimmable_cache_entry(c)
         if has_ssm and non_trimmable:
-            assert pre_gen is not None
-            restored = copy_snapshot_entry(pre_gen.states[i])
-            if restored is not None:
-                cache[i] = restored  # type: ignore
+            if pre_gen is not None:
+                restored = copy_snapshot_entry(pre_gen.states[i])
+                if restored is not None:
+                    cache[i] = restored  # type: ignore
+            else:
+                logger.warning(
+                    f"No snapshot for SSM cache entry {i} ({type(c).__name__}); "
+                    "leaving cache as-is after prefill trim"
+                )
         else:
-            assert not non_trimmable
+            if non_trimmable:
+                raise AssertionError(
+                    f"Cache entry {i} ({type(c).__name__}) is non-trimmable "
+                    f"but has_ssm={has_ssm} — this is a caching logic bug"
+                )
             c.trim(2)
 
     elapsed = time.perf_counter() - start_time

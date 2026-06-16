@@ -59,6 +59,7 @@ from exo.worker.runner.bootstrap import logger
 
 PREFILL_PICKUP_TIMEOUT_SECONDS = 3
 PREFILL_FINISH_TIMEOUT_SECONDS = 300
+WARMUP_TIMEOUT_SECONDS = 600
 
 
 @dataclass
@@ -281,7 +282,27 @@ class Runner:
                 self.update_status(RunnerWarmingUp())
                 self.acknowledge_task(task)
 
-                self.generator.warmup()
+                engine = self.generator
+                warmup_exc: list[BaseException | None] = [None]
+                warmup_done = threading.Event()
+
+                def _run_warmup() -> None:
+                    try:
+                        engine.warmup()
+                    except BaseException as exc:
+                        warmup_exc[0] = exc
+                    finally:
+                        warmup_done.set()
+
+                warmup_thread = threading.Thread(target=_run_warmup, name="warmup", daemon=True)
+                warmup_thread.start()
+                if not warmup_done.wait(timeout=WARMUP_TIMEOUT_SECONDS):
+                    raise TimeoutError(
+                        f"Warmup timed out after {WARMUP_TIMEOUT_SECONDS}s — "
+                        "a peer node likely crashed or is unreachable during the decode barrier"
+                    )
+                if warmup_exc[0] is not None:
+                    raise warmup_exc[0]
 
                 logger.info(
                     f"runner initialized in {time.time() - self.setup_start_time} seconds"
